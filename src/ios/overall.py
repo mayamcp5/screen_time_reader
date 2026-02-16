@@ -10,86 +10,180 @@ from src.parsing.app_name_parsing import clean_app_name, is_valid_app_name
 def preprocess_for_ocr(image_path: str) -> Image.Image:
     """Enhance contrast and brightness, threshold lightly colored text for OCR."""
     img = Image.open(image_path).convert("RGB")
-
-    # Convert to grayscale
     img = ImageOps.grayscale(img)
-
-    # Increase contrast
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.0)
-
-    # Increase brightness slightly
-    enhancer = ImageEnhance.Brightness(img)
-    img = enhancer.enhance(1.2)
-
-    # Optional: resize to make small text more legible
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Brightness(img).enhance(1.2)
     img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
-
-    # Convert to numpy array for OpenCV processing
     img_np = np.array(img)
-
-    # Threshold: make light gray text dark
     _, img_np = cv2.threshold(img_np, 180, 255, cv2.THRESH_BINARY_INV)
-
     return Image.fromarray(img_np)
 
 def preprocess_for_light_text(image_path: str) -> Image.Image:
     """Specifically optimized for very light gray text like the times."""
     img = Image.open(image_path).convert("RGB")
-    
-    # Convert to grayscale
     img = ImageOps.grayscale(img)
-    
-    # Moderate contrast boost for faint text
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.2)
-    
-    # Slightly more brightness
-    enhancer = ImageEnhance.Brightness(img)
-    img = enhancer.enhance(1.3)
-    
-    # Standard resize
+    img = ImageEnhance.Contrast(img).enhance(2.2)
+    img = ImageEnhance.Brightness(img).enhance(1.3)
     img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
-    
     img_np = np.array(img)
-    
-    # Lower threshold to catch lighter gray text (150 instead of 180)
     _, img_np = cv2.threshold(img_np, 150, 255, cv2.THRESH_BINARY_INV)
-    
     return Image.fromarray(img_np)
 
+HOURS = [
+    '12am','1am','2am','3am','4am','5am','6am','7am','8am','9am','10am','11am',
+    '12pm','1pm','2pm','3pm','4pm','5pm','6pm','7pm','8pm','9pm','10pm','11pm'
+]
+
+def classify_pixel(r, g, b):
+    """
+    Return color key for a bar pixel, or None if not a bar pixel.
+    Colors: blue, teal, orange, gray.
+    """
+    r, g, b = int(r), int(g), int(b)
+    if r < 80 and 100 <= g <= 160 and b > 220:
+        return 'blue'
+    if r < 150 and g > 170 and 180 < b < 240:
+        return 'teal'
+    if r > 210 and 140 <= g <= 190 and b < 90:
+        return 'orange'
+    if 48 <= r <= 68 and 48 <= g <= 68 and 48 <= b <= 68 and abs(r-g) < 5 and abs(g-b) < 5:
+        return 'gray'
+    return None
+
+def is_chart_bg(r, g, b):
+    return 20 <= int(r) <= 45 and 20 <= int(g) <= 45 and 20 <= int(b) <= 50
+
+def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
+    """Detect hourly bars and classify by dynamic color-to-category mapping."""
+    img = Image.open(image_path).convert("RGB")
+    arr = np.array(img)
+    img_h, img_w = arr.shape[:2]
+
+    # Find vertical chart regions
+    def find_bar_regions(probe_x):
+        regions = []; in_region = False; start = None
+        for y in range(img_h // 4, img_h):
+            has_bar = classify_pixel(*arr[y, probe_x]) is not None
+            if has_bar and not in_region:
+                start = y; in_region = True
+            elif not has_bar and in_region:
+                if y - start > 50: regions.append((start, y))
+                in_region = False
+        return regions
+
+    best_regions = []; best_probe_x = img_w // 2
+    for probe_x in range(img_w // 3, 2 * img_w // 3, 40):
+        regions = find_bar_regions(probe_x)
+        if len(regions) > len(best_regions):
+            best_regions = regions; best_probe_x = probe_x
+    if not best_regions:
+        return {}
+
+    chart_start, chart_end = best_regions[-1]
+    chart_bottom = chart_end + 1
+
+    # Chart horizontal boundaries
+    y_probe = chart_bottom - 5
+    chart_left = next((x for x in range(img_w) if is_chart_bg(*arr[y_probe, x])), None)
+    chart_right = next((x for x in range(img_w-1, -1, -1) if is_chart_bg(*arr[y_probe, x])), None)
+    if chart_left is None or chart_right is None:
+        return {}
+
+    # Chart top
+    chart_mid_x = (chart_left + chart_right) // 2
+    first_bar_y = next(
+        (y for y in range(chart_start - 50, chart_bottom)
+         if 0 <= y < img_h and classify_pixel(*arr[y, chart_mid_x]) is not None),
+        chart_start
+    )
+    chart_top = first_bar_y
+    for y in range(first_bar_y, max(0, first_bar_y - 200), -1):
+        r, g, b = [int(v) for v in arr[y, chart_mid_x]]
+        if classify_pixel(r, g, b) is None and not (48 <= r <= 70 and abs(r-g) < 10 and abs(g-b) < 10):
+            chart_top = y + 1; break
+
+    corner_padding = 8
+    ymax = (chart_bottom - chart_top) - corner_padding
+
+    # Detect horizontal bars
+    bar_segments = []
+    in_bar = False; seg_start = None
+    for x in range(chart_left, chart_right):
+        col = arr[chart_top:chart_bottom, x]
+        has_bar = any(classify_pixel(*px) is not None for px in col)
+        if has_bar and not in_bar:
+            seg_start = x; in_bar = True
+        elif not has_bar and in_bar:
+            if x - seg_start >= 10: bar_segments.append((seg_start, x - 1))
+            in_bar = False
+    if in_bar and chart_right - seg_start >= 10:
+        bar_segments.append((seg_start, chart_right - 1))
+
+    # Hour mapping
+    if len(bar_segments) >= 2:
+        centers = [(x1 + x2)/2 for x1, x2 in bar_segments]
+        spacings = [centers[i+1]-centers[i] for i in range(len(centers)-1)]
+        bar_spacing = sum(spacings)/len(spacings)
+    else:
+        bar_spacing = (chart_right - chart_left)/24
+
+    result = {'ymax_pixels': ymax}
+    for hour in HOURS:
+        result[hour] = {cat:0 for cat in color_to_category.values()}
+
+    if not bar_segments:
+        return result
+
+    first_center = (bar_segments[0][0] + bar_segments[0][1])/2
+    approx_hour = round((first_center - chart_left)/((chart_right - chart_left)/24))
+    hour_0_x = first_center - approx_hour*bar_spacing
+
+    for x1, x2 in bar_segments:
+        bar_center = (x1 + x2)/2
+        slot_idx = max(0, min(23, round((bar_center - hour_0_x)/bar_spacing)))
+        hour = HOURS[slot_idx]
+
+        best = {cat:0 for cat in color_to_category.values()}
+        best['overall'] = 0
+        for x in range(x1, x2+1):
+            col = arr[chart_top + corner_padding:chart_bottom, x]
+            cats = [classify_pixel(*px) for px in col]
+            bar_rows = [y for y, c in enumerate(cats) if c is not None]
+            if len(bar_rows) < 5:
+                continue
+            total_px = ymax - min(bar_rows)
+            if total_px > best['overall']:
+                best['overall'] = total_px
+                for color, cat_name in color_to_category.items():
+                    best[cat_name] = sum(1 for c in cats if c == color)
+
+        # --- After calculating best for each hour ---
+        cleaned_best = {
+            "overall": best["overall"],                # includes everything
+            "social": best.get("social", 0),
+            "entertainment": best.get("entertainment", 0)
+        }
+        result[hour] = cleaned_best
+
+
+    return result
+
 def process_ios_overall_screenshot(image_path: str):
-    # First pass: normal preprocessing
-    processed_img = preprocess_for_ocr(image_path)
-    text = ocr_image(processed_img)
-
-    print("\n================ NORMAL OCR TEXT ================\n")
-    print(text)
-    print("\n================================================\n")
-
-    # Second pass: aggressive preprocessing for very light gray text
-    light_img = preprocess_for_light_text(image_path)
-    light_text = ocr_image(light_img)
-    
-    print("\n================ LIGHT TEXT OCR ================\n")
-    print(light_text)
-    print("\n===============================================\n")
-
-    # Combine both OCR results
-    combined_text = text + "\n" + light_text
-    lines = [l.strip() for l in combined_text.split("\n") if l.strip()]
+    # OCR passes
+    text = ocr_image(preprocess_for_ocr(image_path))
+    light_text = ocr_image(preprocess_for_light_text(image_path))
+    lines = [l.strip() for l in (text + "\n" + light_text).split("\n") if l.strip()]
 
     result = {
         "date": None,
         "is_yesterday": False,
         "total_time": "0h 0m",
-        "categories": [],   # [{"name": "Social", "time": "5h 38m"}]
-        "top_apps": []      # [{"name": "Instagram", "time": "3h 45m"}]
+        "categories": [],
+        "top_apps": [],
+        "hourly_usage": {}
     }
 
-    # -----------------------------
-    # 1️⃣ Find date and yesterday
-    # -----------------------------
+    # Date
     for line in lines:
         if "yesterday" in line.lower():
             result["is_yesterday"] = True
@@ -97,16 +191,13 @@ def process_ios_overall_screenshot(image_path: str):
             result["date"] = parts[-1].strip() if len(parts) > 1 else line.strip()
             break
 
-    # -----------------------------
-    # 2️⃣ Total screen time
-    # -----------------------------
+    # Total time
     in_total_section = False
     for line in lines:
         if "screen time" in line.lower():
             in_total_section = True
             continue
-        if not in_total_section:
-            continue
+        if not in_total_section: continue
         parsed = parse_time_fragment(line)
         if parsed:
             h, m = parsed
@@ -114,137 +205,53 @@ def process_ios_overall_screenshot(image_path: str):
                 result["total_time"] = f"{h}h {m}m"
                 break
 
-    # -----------------------------
-    # 3️⃣ Category times
-    # -----------------------------
+    # Categories
     for i, line in enumerate(lines):
         if any(cat in line.lower() for cat in ["social", "games", "entertainment"]):
             category_names = line.split()
-            if i + 1 < len(lines):
-                times_line = lines[i + 1]
-                time_matches = re.findall(r"(\d+h\s*\d*m|\d+h|\d*m)", times_line)
+            if i+1 < len(lines):
+                time_matches = re.findall(r"(\d+h\s*\d*m|\d+h|\d*m)", lines[i+1])
                 if time_matches and len(time_matches) == len(category_names):
                     for name, tstr in zip(category_names, time_matches):
                         h, m = parse_time_fragment(tstr)
-                        result["categories"].append({
-                            "name": name,
-                            "time": f"{h}h {m}m"
-                        })
+                        result["categories"].append({"name": name, "time": f"{h}h {m}m"})
             break
 
-    # -----------------------------
-    # 4️⃣ Top apps (first 3 with valid times)
-    # -----------------------------
+    # Build color -> category map dynamically
+    color_order = ['blue', 'teal', 'orange']
+    color_to_category = {}
+    for idx, cat in enumerate(result["categories"][:3]):
+        color_to_category[color_order[idx]] = cat["name"].lower()
+    color_to_category['gray'] = 'other'
+
+    # Top apps
     top_apps = []
-    app_candidates = []
-
-    # Find "MOST USED SHOW CATEGORIES" section - look for ALL occurrences
-    print("\n🔍 DEBUG: Looking for apps in combined text...\n")
-    
-    most_used_indices = []
+    app_lines = {}
     for i, line in enumerate(lines):
-        if "most used" in line.lower():
-            most_used_indices.append(i)
-            print(f"   Found 'MOST USED' at line {i}: '{line}'")
-    
-    # Process apps from BOTH "MOST USED" sections (normal + light OCR)
-    all_app_entries = {}  # {app_name: [line_indices]}
-    
-    for most_used_idx in most_used_indices:
-        in_top_apps = False
-        for i, line in enumerate(lines):
-            if i == most_used_idx:
-                in_top_apps = True
-                continue
-            if not in_top_apps or i <= most_used_idx:
-                continue
-            # Stop at unrelated UI junk or next section
-            if any(skip in line.lower() for skip in ["screen time", "updated", "week"]) or i > most_used_idx + 15:
-                break
-
-            # Skip if this line is itself a time (don't treat times as app names)
-            if parse_time_fragment(line):
-                continue
-
-            # Clean app name
-            cleaned = line.strip()
-            cleaned = re.sub(r'^[a-zA-Z]{1,2}\s+', '', cleaned)  # Remove leading OCR artifacts
-            cleaned = re.sub(r"['\-,\.]+$", '', cleaned)  # Remove trailing punctuation
-            cleaned = re.sub(r"^['\"]|['\"]$", '', cleaned)  # Remove leading/trailing quotes
-            cleaned = cleaned.strip()
-            
-            # Pass through clean_app_name
-            name = clean_app_name(cleaned)
-            if not is_valid_app_name(name) or len(name) < 3:
-                continue
-            
-            # Final normalization - aggressively remove trailing junk
-            # First strip whitespace
-            normalized_name = name.strip()
-            # Then remove any trailing non-alphanumeric characters (except internal spaces)
-            while normalized_name and not normalized_name[-1].isalnum():
-                normalized_name = normalized_name[:-1]
-            normalized_name = normalized_name.strip()
-            
-            # Debug output - show ALL app processing
-            if 'instagram' in line.lower() or 'roblox' in line.lower() or 'tiktok' in line.lower():
-                print(f"      Line {i}: '{line}' → name: '{name}' (len={len(name)}, repr={repr(name)}) → normalized: '{normalized_name}' (len={len(normalized_name)})")
-            
-            # Store this occurrence
-            if normalized_name not in all_app_entries:
-                all_app_entries[normalized_name] = []
-            all_app_entries[normalized_name].append(i)
-    
-    print(f"\n📱 Found apps: {list(all_app_entries.keys())}\n")
-
-    # Build a map of ALL time values in combined text
+        if parse_time_fragment(line): continue
+        name = clean_app_name(line.strip())
+        if is_valid_app_name(name):
+            app_lines[name] = i
+    # Find app times
+    # Build a map of all times in the OCR lines
     time_map = {}
-    print("🔍 DEBUG: Scanning for ALL times in combined text...")
     for i, line in enumerate(lines):
         parsed = parse_time_fragment(line)
         if parsed:
             h, m = parsed
             if h + m > 0:
-                time_str = f"{h}h {m}m"
-                time_map[i] = time_str
-                print(f"   Line {i}: '{line}' → {time_str}")
-    print(f"\n📊 Total times found: {len(time_map)}\n")
+                time_map[i] = f"{h}h {m}m"
 
-    # Match apps with their times by looking near ANY occurrence of the app
-    print("🔗 DEBUG: Matching apps with times...\n")
-    for app_name, line_indices in all_app_entries.items():
-        if len(top_apps) >= 3:
-            break
-        
-        app_time = "0h 0m"
-        print(f"   '{app_name}' found at lines {line_indices}:")
-        
-        # Check occurrences in REVERSE order (so light OCR / later lines get priority)
-        for name_idx in reversed(line_indices):
-            if app_time != "0h 0m":
-                break  # Already found a time
-            
-            # Look in next few lines after this occurrence
-            for offset in range(1, 4):
-                check_idx = name_idx + offset
-                if check_idx in time_map:
-                    app_time = time_map[check_idx]
-                    print(f"      FOUND {app_time} at line {check_idx} (checking from line {name_idx})")
-                    # Remove this time so it's not reused
-                    del time_map[check_idx]
-                    break
-        
-        if app_time == "0h 0m":
-            print(f"      ⚠️ No time found for {app_name}")
-        
-        top_apps.append({"name": app_name, "time": app_time})
+    for name, idx in app_lines.items():
+        for offset in range(1,4):
+            if idx+offset in time_map:
+                top_apps.append({"name": name, "time": time_map[idx+offset]})
+                break
+    # Sort descending
+    def to_min(tstr): h,m = parse_time_fragment(tstr); return h*60 + m
+    result["top_apps"] = sorted(top_apps, key=lambda x: to_min(x["time"]), reverse=True)[:3]
 
-    # Sort top apps by usage time descending
-    def time_to_minutes(tstr):
-        h, m = parse_time_fragment(tstr)
-        return h * 60 + m
-
-    top_apps.sort(key=lambda x: time_to_minutes(x["time"]), reverse=True)
-    result["top_apps"] = top_apps[:3]
+    # Hourly usage
+    result["hourly_usage"] = extract_hourly_chart(image_path, color_to_category)
 
     return result
