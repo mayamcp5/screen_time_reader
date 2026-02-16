@@ -58,122 +58,89 @@ def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
     arr = np.array(img)
     img_h, img_w = arr.shape[:2]
 
-    # Find vertical chart regions (same as before)
+    # 1. Find the Chart Floor & Horizontal Bounds
+    # We use a probe to find the vertical region of the bars first
     def find_bar_regions(probe_x):
         regions = []; in_region = False; start = None
         for y in range(img_h // 4, img_h):
-            has_bar = classify_pixel(*arr[y, probe_x]) is not None
-            if has_bar and not in_region:
-                start = y; in_region = True
-            elif not has_bar and in_region:
+            if classify_pixel(*arr[y, probe_x]) is not None:
+                if not in_region:
+                    start = y; in_region = True
+            elif in_region:
                 if y - start > 50: regions.append((start, y))
                 in_region = False
         return regions
 
-    best_regions = []; best_probe_x = img_w // 2
-    for probe_x in range(img_w // 3, 2 * img_w // 3, 40):
-        regions = find_bar_regions(probe_x)
-        if len(regions) > len(best_regions):
-            best_regions = regions; best_probe_x = probe_x
-    if not best_regions:
-        return {}
-
+    best_regions = find_bar_regions(img_w // 2)
+    if not best_regions: return {}
+    
     chart_start, chart_end = best_regions[-1]
     chart_bottom = chart_end + 1
-
-    # Horizontal boundaries
+    
+    # Use the background color to find the absolute left/right of the grid
     y_probe = chart_bottom - 5
-    chart_left = next((x for x in range(img_w) if is_chart_bg(*arr[y_probe, x])), None)
-    chart_right = next((x for x in range(img_w-1, -1, -1) if is_chart_bg(*arr[y_probe, x])), None)
-    if chart_left is None or chart_right is None:
-        return {}
+    chart_bg_x = [x for x in range(img_w) if is_chart_bg(*arr[y_probe, x])]
+    if not chart_bg_x: return {}
+    chart_left, chart_right = min(chart_bg_x), max(chart_bg_x)
 
-    # Chart top
-    chart_mid_x = (chart_left + chart_right) // 2
-    first_bar_y = next(
-        (y for y in range(chart_start - 50, chart_bottom)
-         if 0 <= y < img_h and classify_pixel(*arr[y, chart_mid_x]) is not None),
-        chart_start
-    )
-    chart_top = first_bar_y
-    for y in range(first_bar_y, max(0, first_bar_y - 200), -1):
-        r, g, b = [int(v) for v in arr[y, chart_mid_x]]
-        if classify_pixel(r, g, b) is None and not (48 <= r <= 70 and abs(r-g) < 10 and abs(g-b) < 10):
-            chart_top = y + 1; break
+    # 2. Fix the Ceiling (Capture the full height)
+    # Instead of scanning for 'clean' space, we look for the highest pixel 
+    # of ANY bar in the entire chart and add a small buffer.
+    absolute_top = chart_bottom
+    for x in range(chart_left, chart_right, 5):
+        for y in range(chart_bottom, max(0, chart_bottom - 400), -1):
+            if classify_pixel(*arr[y, x]):
+                if y < absolute_top: absolute_top = y
+    
+    # Set chart_top slightly above the highest detected bar pixel
+    chart_top = max(0, absolute_top - 5)
 
-    corner_padding = 0
-
-    # Detect horizontal bars (for hour mapping)
-    bar_segments = []
-    in_bar = False; seg_start = None
-    for x in range(chart_left, chart_right):
-        col = arr[chart_top:chart_bottom, x]
-        has_bar = any(classify_pixel(*px) is not None for px in col)
-        if has_bar and not in_bar:
-            seg_start = x; in_bar = True
-        elif not has_bar and in_bar:
-            if x - seg_start >= 10: bar_segments.append((seg_start, x - 1))
-            in_bar = False
-    if in_bar and chart_right - seg_start >= 10:
-        bar_segments.append((seg_start, chart_right - 1))
-
-    if len(bar_segments) >= 2:
-        centers = [(x1 + x2)/2 for x1, x2 in bar_segments]
-        spacings = [centers[i+1]-centers[i] for i in range(len(centers)-1)]
-        bar_spacing = sum(spacings)/len(spacings)
-    else:
-        bar_spacing = (chart_right - chart_left)/24
-
+    # 3. Precise Slot Logic (The 24-Hour Grid)
+    # The total width of the grid represents exactly 24 hours.
+    slot_width = (chart_right - chart_left) / 24
     result = {hour: {"overall": 0, "social": 0, "entertainment": 0} for hour in HOURS}
     tallest_bar = 0
 
-    first_center = (bar_segments[0][0] + bar_segments[0][1])/2
-    approx_hour = round((first_center - chart_left)/((chart_right - chart_left)/24))
-    hour_0_x = first_center - approx_hour*bar_spacing
+    for i in range(24):
+        hour = HOURS[i]
+        # Calculate the center of this hour's slot
+        slot_center_x = int(chart_left + (i * slot_width) + (slot_width / 2))
+        
+        # Scan a few pixels around the center of the slot to find the bar
+        max_h = 0
+        best_cats = []
+        
+        # We check 3 columns in the center of the slot to be robust
+        for x in range(slot_center_x - 1, slot_center_x + 2):
+            if not (0 <= x < img_w): continue
+            
+            # Look at the column from the bottom up
+            col_pixels = []
+            for y in range(chart_bottom, chart_top, -1):
+                cat = classify_pixel(*arr[y, x])
+                if cat:
+                    col_pixels.append(cat)
+            
+            if len(col_pixels) > max_h:
+                max_h = len(col_pixels)
+                best_cats = col_pixels
 
-    for x1, x2 in bar_segments:
-        bar_center = (x1 + x2)/2
-        slot_idx = max(0, min(23, round((bar_center - hour_0_x)/bar_spacing)))
-        hour = HOURS[slot_idx]
-
-        # For each column in the segment, find top/bottom of bar
-        col_heights = []
-        col_colors = []
-        for x in range(x1, x2+1):
-            column = arr[chart_top+corner_padding:chart_bottom, x]
-            bar_rows = [(i, classify_pixel(*px)) for i, px in enumerate(column) if classify_pixel(*px) is not None]
-            if not bar_rows: continue
-            top = min(r for r,_ in bar_rows)
-            bottom = max(r for r,_ in bar_rows)
-            col_heights.append(bottom - top + 1)
-            col_colors.append([c for _, c in bar_rows])
-
-        if not col_heights:
-            continue
-
-        # Take tallest column as overall
-        overall_px = max(col_heights)
-        tallest_bar = max(tallest_bar, overall_px)
-
-        # Count category pixels in the tallest column only
-        tallest_idx = col_heights.index(overall_px)
-        cats_in_col = col_colors[tallest_idx]
-        total_counted = len(cats_in_col)
-        if total_counted == 0:
-            social_px = entertainment_px = 0
-        else:
-            social_px = round(cats_in_col.count("blue")/total_counted*overall_px)
-            entertainment_px = round(cats_in_col.count("orange")/total_counted*overall_px)
-
-        result[hour] = {
-            "overall": overall_px,
-            "social": social_px,
-            "entertainment": entertainment_px
-        }
+        if max_h > 0:
+            # Note: iOS bars are always anchored to the bottom. 
+            # Total height = distance from bottom to highest detected pixel.
+            social_px = round(best_cats.count("blue"))
+            ent_px = round(best_cats.count("orange"))
+            
+            result[hour] = {
+                "overall": max_h,
+                "social": social_px,
+                "entertainment": ent_px
+            }
+            if max_h > tallest_bar:
+                tallest_bar = max_h
 
     result['ymax_pixels'] = tallest_bar
     return result
-
 
 
 def process_ios_overall_screenshot(image_path: str):
