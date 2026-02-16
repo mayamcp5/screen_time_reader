@@ -54,12 +54,11 @@ def is_chart_bg(r, g, b):
     return 20 <= int(r) <= 45 and 20 <= int(g) <= 45 and 20 <= int(b) <= 50
 
 def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
-    """Detect hourly bars and classify by dynamic color-to-category mapping."""
     img = Image.open(image_path).convert("RGB")
     arr = np.array(img)
     img_h, img_w = arr.shape[:2]
 
-    # Find vertical chart regions
+    # Find vertical chart regions (same as before)
     def find_bar_regions(probe_x):
         regions = []; in_region = False; start = None
         for y in range(img_h // 4, img_h):
@@ -82,7 +81,7 @@ def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
     chart_start, chart_end = best_regions[-1]
     chart_bottom = chart_end + 1
 
-    # Chart horizontal boundaries
+    # Horizontal boundaries
     y_probe = chart_bottom - 5
     chart_left = next((x for x in range(img_w) if is_chart_bg(*arr[y_probe, x])), None)
     chart_right = next((x for x in range(img_w-1, -1, -1) if is_chart_bg(*arr[y_probe, x])), None)
@@ -102,10 +101,9 @@ def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
         if classify_pixel(r, g, b) is None and not (48 <= r <= 70 and abs(r-g) < 10 and abs(g-b) < 10):
             chart_top = y + 1; break
 
-    corner_padding = 8
-    ymax = (chart_bottom - chart_top) - corner_padding
+    corner_padding = 0
 
-    # Detect horizontal bars
+    # Detect horizontal bars (for hour mapping)
     bar_segments = []
     in_bar = False; seg_start = None
     for x in range(chart_left, chart_right):
@@ -119,7 +117,6 @@ def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
     if in_bar and chart_right - seg_start >= 10:
         bar_segments.append((seg_start, chart_right - 1))
 
-    # Hour mapping
     if len(bar_segments) >= 2:
         centers = [(x1 + x2)/2 for x1, x2 in bar_segments]
         spacings = [centers[i+1]-centers[i] for i in range(len(centers)-1)]
@@ -127,12 +124,8 @@ def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
     else:
         bar_spacing = (chart_right - chart_left)/24
 
-    result = {'ymax_pixels': ymax}
-    for hour in HOURS:
-        result[hour] = {cat:0 for cat in color_to_category.values()}
-
-    if not bar_segments:
-        return result
+    result = {hour: {"overall": 0, "social": 0, "entertainment": 0} for hour in HOURS}
+    tallest_bar = 0
 
     first_center = (bar_segments[0][0] + bar_segments[0][1])/2
     approx_hour = round((first_center - chart_left)/((chart_right - chart_left)/24))
@@ -143,30 +136,45 @@ def extract_hourly_chart(image_path: str, color_to_category: dict) -> dict:
         slot_idx = max(0, min(23, round((bar_center - hour_0_x)/bar_spacing)))
         hour = HOURS[slot_idx]
 
-        best = {cat:0 for cat in color_to_category.values()}
-        best['overall'] = 0
+        # For each column in the segment, find top/bottom of bar
+        col_heights = []
+        col_colors = []
         for x in range(x1, x2+1):
-            col = arr[chart_top + corner_padding:chart_bottom, x]
-            cats = [classify_pixel(*px) for px in col]
-            bar_rows = [y for y, c in enumerate(cats) if c is not None]
-            if len(bar_rows) < 5:
-                continue
-            total_px = ymax - min(bar_rows)
-            if total_px > best['overall']:
-                best['overall'] = total_px
-                for color, cat_name in color_to_category.items():
-                    best[cat_name] = sum(1 for c in cats if c == color)
+            column = arr[chart_top+corner_padding:chart_bottom, x]
+            bar_rows = [(i, classify_pixel(*px)) for i, px in enumerate(column) if classify_pixel(*px) is not None]
+            if not bar_rows: continue
+            top = min(r for r,_ in bar_rows)
+            bottom = max(r for r,_ in bar_rows)
+            col_heights.append(bottom - top + 1)
+            col_colors.append([c for _, c in bar_rows])
 
-        # --- After calculating best for each hour ---
-        cleaned_best = {
-            "overall": best["overall"],                # includes everything
-            "social": best.get("social", 0),
-            "entertainment": best.get("entertainment", 0)
+        if not col_heights:
+            continue
+
+        # Take tallest column as overall
+        overall_px = max(col_heights)
+        tallest_bar = max(tallest_bar, overall_px)
+
+        # Count category pixels in the tallest column only
+        tallest_idx = col_heights.index(overall_px)
+        cats_in_col = col_colors[tallest_idx]
+        total_counted = len(cats_in_col)
+        if total_counted == 0:
+            social_px = entertainment_px = 0
+        else:
+            social_px = round(cats_in_col.count("blue")/total_counted*overall_px)
+            entertainment_px = round(cats_in_col.count("orange")/total_counted*overall_px)
+
+        result[hour] = {
+            "overall": overall_px,
+            "social": social_px,
+            "entertainment": entertainment_px
         }
-        result[hour] = cleaned_best
 
-
+    result['ymax_pixels'] = tallest_bar
     return result
+
+
 
 def process_ios_overall_screenshot(image_path: str):
     # OCR passes
