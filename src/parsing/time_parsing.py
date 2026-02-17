@@ -18,6 +18,10 @@ def parse_time_fragment(text: str):
     corrected_text = text
     corrected_text = re.sub(r'\b([Ilt]h)\b', '1h', corrected_text, flags=re.IGNORECASE)
     corrected_text = re.sub(r'\b([Ilt])h\s', '1h ', corrected_text, flags=re.IGNORECASE)
+    # Fix Z→2 when followed by digits then m (e.g. "Z6m" → "26m")
+    corrected_text = re.sub(r'\bZ(\d+[mM])', r'2\1', corrected_text)
+    # Fix uppercase M at end of minute token (e.g. "26mM" → "26m", "Z6mM" → "26m")
+    corrected_text = re.sub(r'(\d+[mM])M\b', lambda m: m.group(1).lower(), corrected_text)
     
     # Last occurrence of hours+minutes
     matches = list(re.finditer(HOURS_MIN_PATTERN, corrected_text, re.IGNORECASE))
