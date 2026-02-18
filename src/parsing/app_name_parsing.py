@@ -17,4 +17,6 @@ def is_valid_app_name(name: str) -> bool:
         return False
     if name.isdigit():
         return False
+    # if re.search(r'[\\/:]', candidate) or re.search(r'\d+[a-zA-Z]', candidate):
+    #     return False
     return True
